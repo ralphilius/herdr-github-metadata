@@ -80,6 +80,16 @@ def already_running():
         return False
 
 
+def release_pid():
+    """Remove the pidfile only if it still points at this process."""
+    try:
+        with open(PID_PATH) as handle:
+            if int(handle.read().strip()) == os.getpid():
+                os.unlink(PID_PATH)
+    except Exception:
+        pass
+
+
 def log(message):
     print(message, flush=True)
 
@@ -399,10 +409,7 @@ def main():
             failures += 1
             if failures >= 15:
                 log(f"snapshot failed {failures} times in a row, exiting: {err}")
-                try:
-                    os.unlink(PID_PATH)
-                except Exception:
-                    pass
+                release_pid()
                 return 1
             time.sleep(INTERVAL_SECONDS)
             continue
@@ -411,10 +418,7 @@ def main():
         resolver.save()
         time.sleep(max(0.2, INTERVAL_SECONDS - (time.time() - started)))
     log("github-metadata plugin stopping")
-    try:
-        os.unlink(PID_PATH)
-    except Exception:
-        pass
+    release_pid()
     return 0
 
 
