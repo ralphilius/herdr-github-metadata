@@ -1,0 +1,15 @@
+id = "herdr.github-metadata"
+name = "GitHub Metadata"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Report GitHub metadata for the sidebar as pane tokens. Resolves the PR each agent is working on from its own session record, git worktrees, and gh — pure logic, no LLM."
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["python3", "src/watcher.py"]
+
+[[actions]]
+id = "start"
+title = "Start GitHub metadata watcher"
+contexts = ["global"]
+command = ["python3", "src/watcher.py"]
