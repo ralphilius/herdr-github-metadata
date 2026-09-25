@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""github-metadata plugin: report the PR each agent is working on.
+"""github-metadata plugin: report GitHub metadata per agent pane.
 
-Resolution per agent pane (pure logic, no LLM):
+Tokens (each optional; absent tokens are cleared):
+  pr       "#<n>"          the PR the agent is working on
+  checks   "✓" / "✗[n]" / "⋯"  CI state of that PR
+  blocked  "<label>"       why the agent is blocked (only while blocked)
+  duration "14m"           time in the current state (working/blocked only)
+
+PR resolution per agent pane (pure logic, no LLM):
   1. the agent's own session transcript: the latest worktree it used -> that
      branch's open PR; only when no worktree appears in the tail, the latest
      pull/<n> or `gh pr <verb> <n>` reference
   2. otherwise the pane checkout branch's open PR
   3. otherwise — only when a single agent works in that repo — the repo's most
      recent open PR
-
-The result is reported as the pane token `pr` ("#<n>") and refreshed every 2s
-while the Herdr server runs.
 """
 
 import json
@@ -25,14 +28,19 @@ from collections import defaultdict
 
 INTERVAL_SECONDS = 2.0
 PR_TTL_SECONDS = 120
-PR_LOOKUPS_PER_RUN = 3
+LOOKUPS_PER_RUN = 4
 SESSION_TAIL_BYTES = 400_000
 TOKEN_TTL_MS = 10_000
 SOURCE = "github-metadata"
+TOKEN_NAMES = ("pr", "checks", "blocked", "duration")
 
 WT_NAME_RE = re.compile(r"\.worktrees/([A-Za-z0-9_.-]+)")
 PR_URL_RE = re.compile(r"pull/(\d+)")
 PR_CLI_RE = re.compile(r"gh pr (?:view|checks|review|diff|comment|merge|close|reopen|edit|ready|lock|unlock)\s+(\d+)")
+
+FAILING_STATES = {"FAILURE", "ERROR", "CANCELLED", "ACTION_REQUIRED", "TIMED_OUT", "STARTUP_FAILURE"}
+PENDING_STATES = {"PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED", "WAITING"}
+PASSING_STATES = {"SUCCESS", "SKIPPED", "NEUTRAL"}
 
 _running = True
 
@@ -40,17 +48,6 @@ _running = True
 def _stop(_signum, _frame):
     global _running
     _running = False
-
-
-def already_running():
-    """Guard against duplicate watchers (startup hook + manual action)."""
-    try:
-        with open(PID_PATH) as handle:
-            pid = int(handle.read().strip())
-        os.kill(pid, 0)
-        return pid != os.getpid()
-    except Exception:
-        return False
 
 
 def herdr_bin():
@@ -72,12 +69,55 @@ CACHE_PATH = os.path.join(STATE_DIR, "pr-cache.json")
 PID_PATH = os.path.join(STATE_DIR, "watcher.pid")
 
 
+def already_running():
+    """Guard against duplicate watchers (startup hook + manual action)."""
+    try:
+        with open(PID_PATH) as handle:
+            pid = int(handle.read().strip())
+        os.kill(pid, 0)
+        return pid != os.getpid()
+    except Exception:
+        return False
+
+
 def log(message):
     print(message, flush=True)
 
 
 def run(args, timeout=5, cwd=None):
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+
+
+def humanize(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def summarize_checks(states):
+    failing = [state for state in states if state in FAILING_STATES]
+    if failing:
+        return f"✗{len(failing)}" if len(failing) > 1 else "✗"
+    if any(state in PENDING_STATES for state in states):
+        return "⋯"
+    if any(state in PASSING_STATES for state in states):
+        return "✓"
+    return None
+
+
+def blocked_label(agent):
+    if agent.get("agent_status") != "blocked":
+        return None
+    labels = agent.get("state_labels") or {}
+    if isinstance(labels, list):
+        labels = dict(labels)
+    label = labels.get("blocked") or "blocked"
+    return " ".join(str(label).split())[:48]
 
 
 def repo_info(cwd):
@@ -136,7 +176,7 @@ class Resolver:
     def __init__(self, gh):
         self.gh = gh
         self.now = time.time()
-        self.budget = PR_LOOKUPS_PER_RUN
+        self.budget = LOOKUPS_PER_RUN
         try:
             self.cache = json.load(open(CACHE_PATH))
         except Exception:
@@ -195,11 +235,49 @@ class Resolver:
         self.cache[key] = {"open": state, "at": self.now}
         return state
 
+    def lookup_checks(self, common, repo_dir, number):
+        key = common + "\x00checks#" + str(number)
+        entry = self.cache.get(key)
+        if entry is not None and self.now - entry.get("at", 0) <= PR_TTL_SECONDS:
+            return entry.get("v")
+        if not self.gh or self.budget <= 0:
+            return entry.get("v") if entry else None
+        self.budget -= 1
+        value = entry.get("v") if entry else None
+        try:
+            proc = run([self.gh, "pr", "checks", str(number), "--json", "state"],
+                       timeout=8, cwd=repo_dir)
+            items = json.loads(proc.stdout)
+            value = summarize_checks([str(item.get("state", "")) for item in items])
+        except Exception:
+            pass
+        self.cache[key] = {"v": value, "at": self.now}
+        return value
 
-def report(pane_id, pr):
+    def state_duration(self, pane_id, state):
+        states = self.cache.setdefault("_states", {})
+        entry = states.get(pane_id)
+        if entry is None or entry.get("state") != state:
+            entry = {"state": state, "since": self.now}
+            states[pane_id] = entry
+        return self.now - entry.get("since", self.now)
+
+    def prune_states(self, seen):
+        states = self.cache.get("_states")
+        if not isinstance(states, dict):
+            return
+        self.cache["_states"] = {pane: entry for pane, entry in states.items() if pane in seen}
+
+
+def report(pane_id, values):
     args = [BIN, "pane", "report-metadata", pane_id,
             "--source", SOURCE, "--ttl-ms", str(TOKEN_TTL_MS)]
-    args += ["--token", f"pr={pr}"] if pr else ["--clear-token", "pr"]
+    for name in TOKEN_NAMES:
+        value = values.get(name)
+        if value:
+            args += ["--token", f"{name}={value}"]
+        else:
+            args += ["--clear-token", name]
     try:
         run(args, timeout=5)
     except Exception:
@@ -207,8 +285,7 @@ def report(pane_id, pr):
 
 
 def resolve_agent(agent, panes, agents_per_repo, resolver):
-    """Return "#<n>" for this agent's PR, or None. `resolved` reports whether a
-    definitive answer was reached (so no weaker fallback should apply)."""
+    """Return ("#<n>" or None, repo_info or None) for this agent's PR."""
     pane = panes.get(agent.get("pane_id"), {})
     cwd = (
         agent.get("foreground_cwd")
@@ -218,7 +295,7 @@ def resolve_agent(agent, panes, agents_per_repo, resolver):
     )
     info = repo_info(cwd)
     if not info:
-        return None, True
+        return None, None
     common, root, branch = info
 
     session = agent.get("agent_session") or {}
@@ -236,26 +313,26 @@ def resolve_agent(agent, panes, agents_per_repo, resolver):
         if kind == "pr":
             state = resolver.pr_open(common, root, value)
             if state is True:
-                return f"#{value}", True
+                return f"#{value}", info
             if state is False:
-                return None, True
+                return None, info
         elif kind == "wt":
             wt = worktree_path(root, value)
             if wt:
                 wt_branch = branch_of(wt)
                 if wt_branch:
                     number = resolver.lookup(common + "\x00" + wt_branch, wt, ["--head", wt_branch])
-                    return (f"#{number}" if number else None), True
+                    return (f"#{number}" if number else None), info
 
     if branch:
         number = resolver.lookup(common + "\x00" + branch, cwd, ["--head", branch])
         if number:
-            return f"#{number}", True
+            return f"#{number}", info
         if agents_per_repo[common] == 1:
             number = resolver.lookup(common + "\x00*", cwd, [])
             if number:
-                return f"#{number}", True
-    return None, True
+                return f"#{number}", info
+    return None, info
 
 
 def tick(snap, last_report, resolver):
@@ -273,15 +350,28 @@ def tick(snap, last_report, resolver):
     for agent in agents:
         pane_id = agent["pane_id"]
         seen.add(pane_id)
-        pr, _ = resolve_agent(agent, panes, agents_per_repo, resolver)
-        if last_report.get(pane_id) != pr:
-            last_report[pane_id] = pr
-            log(f"{pane_id} -> {pr or '(none)'}")
-        report(pane_id, pr)
+        status = agent.get("agent_status")
+        pr, info = resolve_agent(agent, panes, agents_per_repo, resolver)
+        values = {}
+        if pr:
+            values["pr"] = pr
+        blocked = blocked_label(agent)
+        if blocked:
+            values["blocked"] = blocked
+        if pr and info:
+            values["checks"] = resolver.lookup_checks(info[0], info[1], int(pr[1:]))
+        if status in ("working", "blocked"):
+            values["duration"] = humanize(resolver.state_duration(pane_id, status))
+        if last_report.get(pane_id) != values:
+            last_report[pane_id] = values
+            pairs = " ".join(f"{name}={value}" for name, value in sorted(values.items())) or "(none)"
+            log(f"{pane_id} -> {pairs}")
+        report(pane_id, values)
 
     for pane_id in list(last_report):
         if pane_id not in seen:
             last_report.pop(pane_id, None)
+    resolver.prune_states(seen)
 
 
 def main():
