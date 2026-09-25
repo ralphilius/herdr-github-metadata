@@ -3,9 +3,9 @@
 
 Tokens (each optional; absent tokens are cleared):
   pr       "#<n>"          the PR the agent is working on
-  checks   "✓" / "✗[n]" / "⋯"  CI state of that PR
+  checks   "CI ●" / "CI ◐" / "CI ○[n]"  passing / running / failing CI on that PR
   blocked  "<label>"       why the agent is blocked (only while blocked)
-  duration "14m"           time in the current state (working/blocked only)
+  duration "working 14m"   time in the current state (working/blocked only)
 
 PR resolution per agent pane (pure logic, no LLM):
   1. the agent's own session transcript: the latest worktree it used -> that
@@ -102,11 +102,11 @@ def humanize(seconds):
 def summarize_checks(states):
     failing = [state for state in states if state in FAILING_STATES]
     if failing:
-        return f"✗{len(failing)}" if len(failing) > 1 else "✗"
+        return f"CI ○{len(failing)}" if len(failing) > 1 else "CI ○"
     if any(state in PENDING_STATES for state in states):
-        return "⋯"
+        return "CI ◐"
     if any(state in PASSING_STATES for state in states):
-        return "✓"
+        return "CI ●"
     return None
 
 
@@ -361,7 +361,7 @@ def tick(snap, last_report, resolver):
         if pr and info:
             values["checks"] = resolver.lookup_checks(info[0], info[1], int(pr[1:]))
         if status in ("working", "blocked"):
-            values["duration"] = humanize(resolver.state_duration(pane_id, status))
+            values["duration"] = f"{status} {humanize(resolver.state_duration(pane_id, status))}"
         if last_report.get(pane_id) != values:
             last_report[pane_id] = values
             pairs = " ".join(f"{name}={value}" for name, value in sorted(values.items())) or "(none)"
