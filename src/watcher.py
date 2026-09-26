@@ -3,7 +3,7 @@
 
 Tokens (each optional; absent tokens are cleared):
   pr       "#<n>"          the PR the agent is working on
-  checks   "CI ●" / "CI ◐" / "CI ○[n]"  passing / running / failing CI on that PR
+  checks   "CI ✓" / "CI ✗[n]" / "CI ⋯"  passing / running / failing CI on that PR
   blocked  "<label>"       why the agent is blocked (only while blocked)
   duration "working 14m"   time in the current state (working/blocked only)
 
@@ -112,11 +112,11 @@ def humanize(seconds):
 def summarize_checks(states):
     failing = [state for state in states if state in FAILING_STATES]
     if failing:
-        return f"CI ○{len(failing)}" if len(failing) > 1 else "CI ○"
+        return f"CI ✗{len(failing)}" if len(failing) > 1 else "CI ✗"
     if any(state in PENDING_STATES for state in states):
-        return "CI ◐"
+        return "CI ⋯"
     if any(state in PASSING_STATES for state in states):
-        return "CI ●"
+        return "CI ✓"
     return None
 
 
