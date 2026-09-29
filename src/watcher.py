@@ -189,15 +189,6 @@ def worktree_path(root, name):
     return None
 
 
-def _inside(directory, parent):
-    """True when directory is parent or nested under it."""
-    if not directory or not parent:
-        return False
-    directory = os.path.abspath(directory)
-    parent = os.path.abspath(parent)
-    return directory == parent or directory.startswith(parent + os.sep)
-
-
 def branch_of(directory):
     try:
         branch = run(["git", "-C", directory, "rev-parse", "--abbrev-ref", "HEAD"], timeout=3).stdout.strip()
@@ -251,27 +242,23 @@ class Resolver:
         return number
 
     def pr_open(self, common, repo_dir, number):
-        """Return (is_open, head_branch); is_open None when unknown."""
         key = common + "\x00#" + str(number)
         entry = self.cache.get(key)
         if entry is not None and _fresh(entry.get("at", 0), self.now, key):
-            return entry.get("open"), entry.get("head")
+            return entry.get("open")
         if not self.gh or self.budget <= 0:
-            return (entry.get("open"), entry.get("head")) if entry else (None, None)
+            return entry.get("open") if entry else None
         self.budget -= 1
-        state, head = None, None
+        state = None
         try:
-            proc = run([self.gh, "pr", "view", str(number), "--json", "state,headRefName"],
+            proc = run([self.gh, "pr", "view", str(number), "--json", "state", "--jq", ".state"],
                        timeout=6, cwd=repo_dir)
             if proc.returncode == 0:
-                payload = json.loads(proc.stdout)
-                state = payload.get("state") == "OPEN"
-                head = payload.get("headRefName") or None
+                state = proc.stdout.strip() == "OPEN"
         except Exception:
             state = entry.get("open") if entry else None
-            head = entry.get("head") if entry else None
-        self.cache[key] = {"open": state, "head": head, "at": self.now}
-        return state, head
+        self.cache[key] = {"open": state, "at": self.now}
+        return state
 
     def lookup_checks(self, common, repo_dir, number):
         key = common + "\x00checks#" + str(number)
@@ -344,27 +331,27 @@ def resolve_agent(agent, panes, agents_per_repo, resolver, info=None):
         if refs:
             # Newest mention wins across kinds: a worktree string sitting
             # earlier in the transcript must not override a PR the agent
-            # looked at more recently.
-            _, kind, value = max(refs, key=lambda ref: ref[0])
+            # looked at more recently (or vice versa).
+            ordered = sorted(refs, key=lambda ref: ref[0], reverse=True)
+            _, kind, value = ordered[0]
             if kind == "pr":
-                is_open, head = resolver.pr_open(common, root, value)
-                if is_open is True:
-                    # Same staleness rule as worktrees: an open PR the pane
-                    # is no longer on (different checkout branch) is history.
-                    if head and branch and head != branch:
-                        pass
-                    else:
-                        return f"#{value}", info
-                elif is_open is False:
-                    return None, info
-            elif kind == "wt":
+                state = resolver.pr_open(common, root, value)
+                if state is True:
+                    return f"#{value}", info
+                if state is False:
+                    # Latest PR focus is done (merged/closed): fall back to
+                    # the newest worktree — the agent's durable work context
+                    # usually outlives any single PR.
+                    newest_wt = next((ref for ref in ordered if ref[1] == "wt"), None)
+                    if newest_wt is None:
+                        return None, info
+                    kind, value = newest_wt[1], newest_wt[2]
+                # Unknown state: fall through to branch rules.
+            if kind == "wt":
                 wt = worktree_path(root, value)
                 if wt:
                     wt_branch = branch_of(wt)
-                    # Stale guard: trust the transcript worktree only while
-                    # the pane sits on its branch or inside it. Otherwise the
-                    # mention is history (e.g. idle on master weeks later).
-                    if wt_branch and (branch == wt_branch or _inside(cwd, wt)):
+                    if wt_branch:
                         number = resolver.lookup(common + "\x00" + wt_branch, wt, ["--head", wt_branch])
                         return (f"#{number}" if number else None), info
 

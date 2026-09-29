@@ -12,12 +12,11 @@ the sidebar — currently the pull request it is working on.
 Resolution order per agent:
 
 1. The newest worktree-or-PR mention in the tail of the agent's own session
-   transcript — whichever kind the agent touched most recently. Either kind
-   only counts while the pane is still on that work: a worktree mention
-   needs the pane on its branch or inside it, and a `pull/<n>` mention needs
-   its PR branch to match the pane's checkout. Anything older (e.g. idle on
-   `master` weeks later, or a merged PR) clears the token instead of
-   misattributing it.
+   transcript — whichever kind the agent touched most recently. An open PR
+   mention resolves directly; when the newest PR is already merged/closed,
+   resolution falls back to the newest worktree mention, since the agent's
+   durable work context usually outlives any single PR. (`pull/<n>` / `gh pr
+   <verb> <n>` references count as PR mentions.)
 2. Otherwise the pane's checkout branch's open PR.
 3. Otherwise — only when a single agent works in that repository — the
    repository's most recent open PR.
