@@ -335,17 +335,11 @@ def resolve_agent(agent, panes, agents_per_repo, resolver, info=None):
             ordered = sorted(refs, key=lambda ref: ref[0], reverse=True)
             _, kind, value = ordered[0]
             if kind == "pr":
+                # A PR mention identifies the agent's task whether the PR is
+                # still open or already merged — show the number either way.
                 state = resolver.pr_open(common, root, value)
-                if state is True:
+                if state is not None:
                     return f"#{value}", info
-                if state is False:
-                    # Latest PR focus is done (merged/closed): fall back to
-                    # the newest worktree — the agent's durable work context
-                    # usually outlives any single PR.
-                    newest_wt = next((ref for ref in ordered if ref[1] == "wt"), None)
-                    if newest_wt is None:
-                        return None, info
-                    kind, value = newest_wt[1], newest_wt[2]
                 # Unknown state: fall through to branch rules.
             if kind == "wt":
                 wt = worktree_path(root, value)
