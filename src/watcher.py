@@ -251,23 +251,27 @@ class Resolver:
         return number
 
     def pr_open(self, common, repo_dir, number):
+        """Return (is_open, head_branch); is_open None when unknown."""
         key = common + "\x00#" + str(number)
         entry = self.cache.get(key)
         if entry is not None and _fresh(entry.get("at", 0), self.now, key):
-            return entry.get("open")
+            return entry.get("open"), entry.get("head")
         if not self.gh or self.budget <= 0:
-            return entry.get("open") if entry else None
+            return (entry.get("open"), entry.get("head")) if entry else (None, None)
         self.budget -= 1
-        state = None
+        state, head = None, None
         try:
-            proc = run([self.gh, "pr", "view", str(number), "--json", "state", "--jq", ".state"],
+            proc = run([self.gh, "pr", "view", str(number), "--json", "state,headRefName"],
                        timeout=6, cwd=repo_dir)
             if proc.returncode == 0:
-                state = proc.stdout.strip() == "OPEN"
+                payload = json.loads(proc.stdout)
+                state = payload.get("state") == "OPEN"
+                head = payload.get("headRefName") or None
         except Exception:
             state = entry.get("open") if entry else None
-        self.cache[key] = {"open": state, "at": self.now}
-        return state
+            head = entry.get("head") if entry else None
+        self.cache[key] = {"open": state, "head": head, "at": self.now}
+        return state, head
 
     def lookup_checks(self, common, repo_dir, number):
         key = common + "\x00checks#" + str(number)
@@ -343,10 +347,15 @@ def resolve_agent(agent, panes, agents_per_repo, resolver, info=None):
             # looked at more recently.
             _, kind, value = max(refs, key=lambda ref: ref[0])
             if kind == "pr":
-                state = resolver.pr_open(common, root, value)
-                if state is True:
-                    return f"#{value}", info
-                if state is False:
+                is_open, head = resolver.pr_open(common, root, value)
+                if is_open is True:
+                    # Same staleness rule as worktrees: an open PR the pane
+                    # is no longer on (different checkout branch) is history.
+                    if head and branch and head != branch:
+                        pass
+                    else:
+                        return f"#{value}", info
+                elif is_open is False:
                     return None, info
             elif kind == "wt":
                 wt = worktree_path(root, value)
