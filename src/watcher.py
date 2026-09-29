@@ -16,6 +16,7 @@ PR resolution per agent pane (pure logic, no LLM):
      recent open PR
 """
 
+import hashlib
 import json
 import os
 import re
@@ -28,10 +29,12 @@ from collections import defaultdict
 
 INTERVAL_SECONDS = 2.0
 PR_TTL_SECONDS = 120
-LOOKUPS_PER_RUN = 2
+TTL_JITTER_SECONDS = 30
+LOOKUPS_PER_RUN = 4
 SESSION_TAIL_BYTES = 400_000
 TOKEN_TTL_MS = 60_000
 HEARTBEAT_SECONDS = 30.0
+HEARTBEAT_SPREAD_SECONDS = 10
 SOURCE = "github-metadata"
 TOKEN_NAMES = ("pr", "checks", "blocked", "duration")
 
@@ -89,6 +92,17 @@ def release_pid():
                 os.unlink(PID_PATH)
     except Exception:
         pass
+
+
+def _phase(key, spread):
+    """Deterministic 0..spread-1 offset for a key (stagger periodic work)."""
+    digest = hashlib.md5(key.encode("utf-8", "replace")).hexdigest()
+    return int(digest, 16) % spread
+
+
+def _fresh(entry_at, now, key):
+    """Cache freshness with per-key jitter so entries don't expire in waves."""
+    return now - entry_at <= PR_TTL_SECONDS + _phase(key, TTL_JITTER_SECONDS * 2 + 1) - TTL_JITTER_SECONDS
 
 
 def log(message):
@@ -212,7 +226,7 @@ class Resolver:
 
     def lookup(self, key, repo_dir, extra):
         entry = self.cache.get(key)
-        if entry is not None and self.now - entry.get("at", 0) <= PR_TTL_SECONDS:
+        if entry is not None and _fresh(entry.get("at", 0), self.now, key):
             return entry.get("pr")
         if not self.gh or self.budget <= 0:
             return entry.get("pr") if entry else None
@@ -230,7 +244,7 @@ class Resolver:
     def pr_open(self, common, repo_dir, number):
         key = common + "\x00#" + str(number)
         entry = self.cache.get(key)
-        if entry is not None and self.now - entry.get("at", 0) <= PR_TTL_SECONDS:
+        if entry is not None and _fresh(entry.get("at", 0), self.now, key):
             return entry.get("open")
         if not self.gh or self.budget <= 0:
             return entry.get("open") if entry else None
@@ -249,7 +263,7 @@ class Resolver:
     def lookup_checks(self, common, repo_dir, number):
         key = common + "\x00checks#" + str(number)
         entry = self.cache.get(key)
-        if entry is not None and self.now - entry.get("at", 0) <= PR_TTL_SECONDS:
+        if entry is not None and _fresh(entry.get("at", 0), self.now, key):
             return entry.get("v")
         if not self.gh or self.budget <= 0:
             return entry.get("v") if entry else None
@@ -384,7 +398,11 @@ def tick(snap, last_report, resolver, now=None, last_sent=None):
             values["duration"] = f"{status} {humanize(resolver.state_duration(pane_id, status))}"
         prev = last_report.get(pane_id)
         sent_at = last_sent.get(pane_id, 0)
-        if prev != values or (now - sent_at) >= HEARTBEAT_SECONDS:
+        heartbeat_due = (
+            bool(values)
+            and (now - sent_at) >= HEARTBEAT_SECONDS + _phase(pane_id, HEARTBEAT_SPREAD_SECONDS)
+        )
+        if prev != values or heartbeat_due:
             last_report[pane_id] = dict(values)
             last_sent[pane_id] = now
             pairs = " ".join(f"{name}={value}" for name, value in sorted(values.items())) or "(none)"
