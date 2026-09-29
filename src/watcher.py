@@ -28,9 +28,10 @@ from collections import defaultdict
 
 INTERVAL_SECONDS = 2.0
 PR_TTL_SECONDS = 120
-LOOKUPS_PER_RUN = 4
+LOOKUPS_PER_RUN = 2
 SESSION_TAIL_BYTES = 400_000
-TOKEN_TTL_MS = 10_000
+TOKEN_TTL_MS = 60_000
+HEARTBEAT_SECONDS = 30.0
 SOURCE = "github-metadata"
 TOKEN_NAMES = ("pr", "checks", "blocked", "duration")
 
@@ -101,7 +102,7 @@ def run(args, timeout=5, cwd=None):
 def humanize(seconds):
     seconds = max(0, int(seconds))
     if seconds < 60:
-        return f"{seconds}s"
+        return f"{seconds // 10 * 10}s"
     if seconds < 3600:
         return f"{seconds // 60}m"
     if seconds < 86400:
@@ -294,7 +295,7 @@ def report(pane_id, values):
         pass
 
 
-def resolve_agent(agent, panes, agents_per_repo, resolver):
+def resolve_agent(agent, panes, agents_per_repo, resolver, info=None):
     """Return ("#<n>" or None, repo_info or None) for this agent's PR."""
     pane = panes.get(agent.get("pane_id"), {})
     cwd = (
@@ -303,7 +304,8 @@ def resolve_agent(agent, panes, agents_per_repo, resolver):
         or pane.get("foreground_cwd")
         or pane.get("cwd")
     )
-    info = repo_info(cwd)
+    if info is None:
+        info = repo_info(cwd)
     if not info:
         return None, None
     common, root, branch = info
@@ -345,14 +347,22 @@ def resolve_agent(agent, panes, agents_per_repo, resolver):
     return None, info
 
 
-def tick(snap, last_report, resolver):
+def tick(snap, last_report, resolver, now=None, last_sent=None):
+    if now is None:
+        now = time.time()
+    if last_sent is None:
+        if not hasattr(tick, "_last_sent"):
+            tick._last_sent = {}
+        last_sent = tick._last_sent
     panes = {pane["pane_id"]: pane for pane in snap.get("panes", [])}
     agents = [agent for agent in snap.get("agents", []) if agent.get("pane_id")]
     agents_per_repo = defaultdict(int)
+    info_by_pane = {}
     for agent in agents:
         pane = panes.get(agent.get("pane_id"), {})
         cwd = agent.get("foreground_cwd") or agent.get("cwd") or pane.get("foreground_cwd") or pane.get("cwd")
         info = repo_info(cwd)
+        info_by_pane[agent.get("pane_id")] = info
         if info:
             agents_per_repo[info[0]] += 1
 
@@ -361,7 +371,7 @@ def tick(snap, last_report, resolver):
         pane_id = agent["pane_id"]
         seen.add(pane_id)
         status = agent.get("agent_status")
-        pr, info = resolve_agent(agent, panes, agents_per_repo, resolver)
+        pr, info = resolve_agent(agent, panes, agents_per_repo, resolver, info_by_pane.get(pane_id))
         values = {}
         if pr:
             values["pr"] = pr
@@ -372,15 +382,19 @@ def tick(snap, last_report, resolver):
             values["checks"] = resolver.lookup_checks(info[0], info[1], int(pr[1:]))
         if status in ("working", "blocked"):
             values["duration"] = f"{status} {humanize(resolver.state_duration(pane_id, status))}"
-        if last_report.get(pane_id) != values:
-            last_report[pane_id] = values
+        prev = last_report.get(pane_id)
+        sent_at = last_sent.get(pane_id, 0)
+        if prev != values or (now - sent_at) >= HEARTBEAT_SECONDS:
+            last_report[pane_id] = dict(values)
+            last_sent[pane_id] = now
             pairs = " ".join(f"{name}={value}" for name, value in sorted(values.items())) or "(none)"
             log(f"{pane_id} -> {pairs}")
-        report(pane_id, values)
+            report(pane_id, values)
 
     for pane_id in list(last_report):
         if pane_id not in seen:
             last_report.pop(pane_id, None)
+            last_sent.pop(pane_id, None)
     resolver.prune_states(seen)
 
 
