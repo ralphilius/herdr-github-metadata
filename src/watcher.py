@@ -189,6 +189,15 @@ def worktree_path(root, name):
     return None
 
 
+def _inside(directory, parent):
+    """True when directory is parent or nested under it."""
+    if not directory or not parent:
+        return False
+    directory = os.path.abspath(directory)
+    parent = os.path.abspath(parent)
+    return directory == parent or directory.startswith(parent + os.sep)
+
+
 def branch_of(directory):
     try:
         branch = run(["git", "-C", directory, "rev-parse", "--abbrev-ref", "HEAD"], timeout=3).stdout.strip()
@@ -328,27 +337,27 @@ def resolve_agent(agent, panes, agents_per_repo, resolver, info=None):
     session_path = session.get("value") if session.get("kind") == "path" else None
     if session_path and os.path.isfile(session_path):
         refs = session_refs(session_path)
-        worktrees = [ref for ref in refs if ref[1] == "wt"]
-        pr_refs = [ref for ref in refs if ref[1] == "pr"]
-        if worktrees:
-            kind, value = "wt", max(worktrees, key=lambda ref: ref[0])[2]
-        elif pr_refs:
-            kind, value = "pr", max(pr_refs, key=lambda ref: ref[0])[2]
-        else:
-            kind, value = None, None
-        if kind == "pr":
-            state = resolver.pr_open(common, root, value)
-            if state is True:
-                return f"#{value}", info
-            if state is False:
-                return None, info
-        elif kind == "wt":
-            wt = worktree_path(root, value)
-            if wt:
-                wt_branch = branch_of(wt)
-                if wt_branch:
-                    number = resolver.lookup(common + "\x00" + wt_branch, wt, ["--head", wt_branch])
-                    return (f"#{number}" if number else None), info
+        if refs:
+            # Newest mention wins across kinds: a worktree string sitting
+            # earlier in the transcript must not override a PR the agent
+            # looked at more recently.
+            _, kind, value = max(refs, key=lambda ref: ref[0])
+            if kind == "pr":
+                state = resolver.pr_open(common, root, value)
+                if state is True:
+                    return f"#{value}", info
+                if state is False:
+                    return None, info
+            elif kind == "wt":
+                wt = worktree_path(root, value)
+                if wt:
+                    wt_branch = branch_of(wt)
+                    # Stale guard: trust the transcript worktree only while
+                    # the pane sits on its branch or inside it. Otherwise the
+                    # mention is history (e.g. idle on master weeks later).
+                    if wt_branch and (branch == wt_branch or _inside(cwd, wt)):
+                        number = resolver.lookup(common + "\x00" + wt_branch, wt, ["--head", wt_branch])
+                        return (f"#{number}" if number else None), info
 
     if branch:
         number = resolver.lookup(common + "\x00" + branch, cwd, ["--head", branch])
